@@ -36194,6 +36194,9 @@ async function postGithubReview(ctx, token, payload, fetchImpl = fetch) {
     if (!res.ok) {
         throw new RunnerError(`GitHub API error posting review (${url}): ${res.status} ${await res.text().catch(() => '')}`);
     }
+    // The new review's id lets the supersede step exclude it. Unparseable → undefined.
+    const created = (await res.json().catch(() => null));
+    return typeof created?.id === 'number' ? created.id : undefined;
 }
 /** Post a plain issue comment (no review event) — `post_as: 'pr_comment'`. */
 async function postPrComment(ctx, token, body, fetchImpl = fetch) {
@@ -36209,6 +36212,127 @@ async function postPrComment(ctx, token, body, fetchImpl = fetch) {
     if (!res.ok) {
         throw new RunnerError(`GitHub API error posting PR comment (${url}): ${res.status} ${await res.text().catch(() => '')}`);
     }
+}
+/** Invisible marker appended as the last line of every posted body, per agent slug. */
+function agentMarker(slug) {
+    return `<!-- devdigest-agent:${slug} -->`;
+}
+function withMarker(body, slug) {
+    return `${body}\n\n${agentMarker(slug)}`;
+}
+const PAGE_SIZE = 100;
+const MAX_PAGES = 5;
+/** Thrown by best-effort helpers; carries the HTTP status (or 'network'). */
+class CleanupError extends Error {
+    status;
+    constructor(status) {
+        super(String(status));
+        this.status = status;
+    }
+}
+async function ghJson(url, token, fetchImpl, method, payload) {
+    let res;
+    try {
+        res = await fetchImpl(url, {
+            method,
+            headers: {
+                ...authHeaders(token, 'application/vnd.github+json'),
+                ...(payload !== undefined ? { 'Content-Type': 'application/json' } : {}),
+            },
+            ...(payload !== undefined ? { body: JSON.stringify(payload) } : {}),
+        });
+    }
+    catch {
+        throw new CleanupError('network');
+    }
+    if (!res.ok)
+        throw new CleanupError(res.status);
+    return res.json().catch(() => null);
+}
+/** Paginated list (per_page=100, at most MAX_PAGES pages). */
+async function listAll(url, token, fetchImpl) {
+    const out = [];
+    for (let page = 1; page <= MAX_PAGES; page++) {
+        const batch = await ghJson(`${url}?per_page=${PAGE_SIZE}&page=${page}`, token, fetchImpl, 'GET');
+        if (!Array.isArray(batch))
+            break;
+        out.push(...batch);
+        if (batch.length < PAGE_SIZE)
+            break;
+    }
+    return out;
+}
+const isBot = (i) => i.user?.type === 'Bot';
+/**
+ * Create the agent's PR comment, or PATCH the bot's earlier marked one in place.
+ * Looking up the old comment is best effort: any lookup/PATCH failure falls
+ * back to creating a new comment, so posting itself is never skipped.
+ */
+async function upsertPrComment(ctx, token, body, marker, fetchImpl = fetch, onCleanupError = () => { }) {
+    const base = `${GITHUB_API_BASE}/repos/${ctx.owner}/${ctx.repo}/issues`;
+    try {
+        const existing = (await listAll(`${base}/${ctx.prNumber}/comments`, token, fetchImpl)).find((c) => isBot(c) && (c.body ?? '').includes(marker));
+        if (existing) {
+            await ghJson(`${base}/comments/${existing.id}`, token, fetchImpl, 'PATCH', { body });
+            return;
+        }
+    }
+    catch (err) {
+        onCleanupError(err instanceof CleanupError ? err.status : 'network');
+    }
+    await postPrComment(ctx, token, body, fetchImpl);
+}
+/** Legacy header the runner generated before the marker existed: `## <name> — …` or bare `## <name>`. */
+function hasLegacyHeader(body, agentName) {
+    const head = `## ${agentName}`;
+    if (!body.startsWith(head))
+        return false;
+    const rest = body.slice(head.length);
+    return rest === '' || /^\r?\n/.test(rest) || /^ [—–-] /.test(rest);
+}
+/**
+ * Retire this agent's earlier reviews: dismiss CHANGES_REQUESTED/APPROVED ones,
+ * rewrite COMMENTED ones (not dismissable). Best effort — never throws; returns
+ * the first failing status (or null) so the caller can log one line.
+ */
+async function supersedePreviousReviews(ctx, token, opts, fetchImpl = fetch) {
+    const base = `${GITHUB_API_BASE}/repos/${ctx.owner}/${ctx.repo}/pulls/${ctx.prNumber}/reviews`;
+    let firstFailure = null;
+    const note = (err) => {
+        firstFailure ??= err instanceof CleanupError ? err.status : 'network';
+    };
+    let reviews;
+    try {
+        reviews = await listAll(base, token, fetchImpl);
+    }
+    catch (err) {
+        note(err);
+        return firstFailure;
+    }
+    const mine = reviews.filter((r) => {
+        if (r.id === opts.excludeId || !isBot(r))
+            return false;
+        const body = r.body ?? '';
+        return body.includes(opts.marker) || hasLegacyHeader(body, opts.agentName);
+    });
+    for (const r of mine) {
+        try {
+            if (r.state === 'CHANGES_REQUESTED' || r.state === 'APPROVED') {
+                await ghJson(`${base}/${r.id}/dismissals`, token, fetchImpl, 'PUT', {
+                    message: `Superseded by a newer DevDigest review (${opts.shortRef})`,
+                });
+            }
+            else if (r.state === 'COMMENTED') {
+                await ghJson(`${base}/${r.id}`, token, fetchImpl, 'PUT', {
+                    body: `Superseded by a newer review.\n\n${opts.marker}`,
+                });
+            }
+        }
+        catch (err) {
+            note(err);
+        }
+    }
+    return firstFailure;
 }
 
 ;// CONCATENATED MODULE: ./src/artifact.ts
@@ -36287,6 +36411,7 @@ function redactSecrets(text, secrets) {
 
 
 
+
 async function runCi(deps) {
     const readFile = deps.readFile ?? external_node_fs_namespaceObject.readFileSync;
     const readDir = deps.readDir ?? external_node_fs_namespaceObject.readdirSync;
@@ -36296,13 +36421,15 @@ async function runCi(deps) {
     const secrets = deps.secrets ?? [];
     const redact = (text) => redactSecrets(text, secrets);
     const fetchDiffImpl = deps.fetchDiff ?? fetchPrDiff;
+    const log = deps.log ?? ((line) => console.warn(line));
+    const warnSupersede = (status) => log(redact(`[agent-runner] could not supersede previous review: ${status}`));
     try {
         // 1. Load + validate the manifest BEFORE it is used for anything (AC-20).
-        const manifest = loadManifest(deps.devdigestDir, {
-            readFile,
-            readDir,
-            agent: deps.env.DEVDIGEST_AGENT,
-        });
+        const fsDeps = { readFile, readDir, agent: deps.env.DEVDIGEST_AGENT };
+        const manifestPath = findManifestPath(deps.devdigestDir, fsDeps);
+        const manifest = loadAgentManifest(manifestPath, fsDeps);
+        const slug = external_node_path_default().basename(manifestPath).replace(/\.ya?ml$/, '');
+        const marker = agentMarker(slug);
         const skills = loadSkillBodies(deps.devdigestDir, manifest.skills, readFile);
         // 2. Resolve CI context (PR number/title/body/repo) from env + event payload.
         const ctx = resolvePrContext(deps.env, readFile);
@@ -36368,10 +36495,23 @@ async function runCi(deps) {
         writeFile(deps.resultPath, `${JSON.stringify(artifact, null, 2)}\n`);
         // 7. Post per `post_as` (AC-24).
         if (deps.postAs === 'github_review') {
-            await postGithubReview(ctx, githubToken, payload, fetchImpl);
+            // The marker is added only to what is POSTED, never to `payload`/the artifact.
+            const newId = await postGithubReview(ctx, githubToken, { ...payload, body: withMarker(payload.body, slug) }, fetchImpl);
+            // Supersede AFTER the new review exists so there is never a window with
+            // none. Best effort; unknown new id → skip rather than risk dismissing it.
+            if (newId !== undefined) {
+                const status = await supersedePreviousReviews(ctx, githubToken, {
+                    marker,
+                    agentName: manifest.name,
+                    excludeId: newId,
+                    shortRef: ctx.headSha ? ctx.headSha.slice(0, 7) : (deps.env.GITHUB_RUN_ID ?? 'latest run'),
+                }, fetchImpl);
+                if (status !== null)
+                    warnSupersede(status);
+            }
         }
         else if (deps.postAs === 'pr_comment') {
-            await postPrComment(ctx, githubToken, payload.body, fetchImpl);
+            await upsertPrComment(ctx, githubToken, withMarker(payload.body, slug), marker, fetchImpl, warnSupersede);
         }
         // 'none' → post nothing (exit-code only).
         // 8. Exit non-zero IFF the gate triggered REQUEST_CHANGES (AC-25).
