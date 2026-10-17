@@ -1,8 +1,8 @@
 # devdigest-workflow-version: 1
-name: DevDigest Review
+name: DevDigest Review (security-reviewer)
 on:
   pull_request:
-    types: [opened, synchronize]
+    types: [opened, synchronize, reopened]
 permissions:
   contents: read
   pull-requests: write
@@ -26,7 +26,8 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           GITHUB_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          DEVDIGEST_POST_AS: github_review
+          DEVDIGEST_POST_AS: pr_comment
+          DEVDIGEST_AGENT: security-reviewer
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:

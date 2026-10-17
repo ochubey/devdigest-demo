@@ -25098,6 +25098,7 @@ const ComposeReviewPreview = types_objectType({
 const CI_WORKFLOW_VERSION = 1;
 const CI_RUNNER_VERSION = '2';
 const CI_BRANCH = 'devdigest/ci';
+/** The LEGACY single-agent workflow path (installations created before one workflow per agent). New ones use `.github/workflows/devdigest-review-<slug>.yml`. */
 const CI_WORKFLOW_PATH = '.github/workflows/devdigest-review.yml';
 const CI_RESULT_ARTIFACT_NAME = 'devdigest-result';
 const CI_TRIGGERS = ['opened', 'synchronize', 'reopened'];
@@ -25106,7 +25107,6 @@ const CiPostAs = types_enumType(['github_review', 'pr_comment', 'none']);
 const CiVerdict = types_enumType(['APPROVE', 'COMMENT', 'REQUEST_CHANGES']);
 const CiErrorCode = types_enumType([
     'ci_provider_unsupported',
-    'ci_repo_taken',
     'ci_repo_not_connected',
     'ci_runner_missing',
     'ci_workflow_unsafe',
@@ -25290,6 +25290,9 @@ const CiResultArtifact = types_objectType({
     verdict: CiVerdict.nullish(),
     blockers: types_numberType().int().nullish(),
 });
+/** Whether the OpenRouter secret exists in the repo's Actions secrets (the value is never read). */
+const CiSecretState = types_enumType(['set', 'not_set', 'unknown']);
+const CiSecretStatus = types_objectType({ OPENROUTER_API_KEY: CiSecretState });
 // ==== SPEC-05 export to CI: end ====
 // ===========================================================================
 // Conformance (PRD ↔ PR) — API record (the analysis shape is `Conformance`)
@@ -25643,6 +25646,11 @@ const CuratorResult = types_objectType({
     removed: types_numberType().int(),
     dry_run: types_booleanType(),
 });
+// ---------------------------------------------------------------------------
+// Latest multi-agent run of a repo
+// ---------------------------------------------------------------------------
+/** `GET /multi-agent-runs/latest?repoId=` — newest multi-agent run id, or null. */
+const LatestMultiAgentRun = types_objectType({ id: types_stringType().nullable() });
 
 ;// CONCATENATED MODULE: ../server/src/vendor/shared/contracts/productionize.ts
 
@@ -35852,7 +35860,11 @@ class RunnerError extends Error {
 
 
 
-/** Find the single agent manifest file under `<devdigestDir>/agents/`. */
+const AGENT_SLUG = /^[a-z0-9-]+$/;
+/**
+ * Find the agent manifest under `<devdigestDir>/agents/`: the one named by
+ * `deps.agent` (`DEVDIGEST_AGENT`) when set, otherwise the single manifest.
+ */
 function findManifestPath(devdigestDir, deps = {}) {
     const readDir = deps.readDir ?? external_node_fs_namespaceObject.readdirSync;
     const agentsDir = external_node_path_default().join(devdigestDir, 'agents');
@@ -35864,11 +35876,23 @@ function findManifestPath(devdigestDir, deps = {}) {
         throw new RunnerError(`Agent manifest directory not found: ${agentsDir} (${err.message})`);
     }
     const yamlFiles = entries.filter((f) => f.endsWith('.yaml') || f.endsWith('.yml'));
+    const agent = deps.agent?.trim() ? deps.agent.trim() : undefined;
+    if (agent !== undefined) {
+        if (!AGENT_SLUG.test(agent)) {
+            throw new RunnerError(`DEVDIGEST_AGENT must be a slug matching ${AGENT_SLUG} (got: ${JSON.stringify(agent)})`);
+        }
+        const file = `${agent}.yaml`;
+        if (!yamlFiles.includes(file)) {
+            const available = yamlFiles.map((f) => f.replace(/\.ya?ml$/, ''));
+            throw new RunnerError(`No agent manifest for DEVDIGEST_AGENT="${agent}" in ${agentsDir}; available: ${available.length ? available.join(', ') : '(none)'}`);
+        }
+        return external_node_path_default().join(agentsDir, file);
+    }
     if (yamlFiles.length === 0) {
         throw new RunnerError(`No agent manifest (*.yaml) found in ${agentsDir}`);
     }
     if (yamlFiles.length > 1) {
-        throw new RunnerError(`Expected exactly one agent manifest in ${agentsDir}, found ${yamlFiles.length}: ${yamlFiles.join(', ')}`);
+        throw new RunnerError(`Found ${yamlFiles.length} agent manifests in ${agentsDir}; set DEVDIGEST_AGENT to one of these slugs: ${yamlFiles.map((f) => f.replace(/\.ya?ml$/, '')).join(', ')}`);
     }
     return external_node_path_default().join(agentsDir, yamlFiles[0]);
 }
@@ -36274,7 +36298,11 @@ async function runCi(deps) {
     const fetchDiffImpl = deps.fetchDiff ?? fetchPrDiff;
     try {
         // 1. Load + validate the manifest BEFORE it is used for anything (AC-20).
-        const manifest = loadManifest(deps.devdigestDir, { readFile, readDir });
+        const manifest = loadManifest(deps.devdigestDir, {
+            readFile,
+            readDir,
+            agent: deps.env.DEVDIGEST_AGENT,
+        });
         const skills = loadSkillBodies(deps.devdigestDir, manifest.skills, readFile);
         // 2. Resolve CI context (PR number/title/body/repo) from env + event payload.
         const ctx = resolvePrContext(deps.env, readFile);
